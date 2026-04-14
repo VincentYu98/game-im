@@ -181,7 +181,7 @@ game-im/
 
 ## 设计文档
 
-详细设计见 [game-im-system-design.md](../game-im-system-design.md)。
+详细设计见 [game-im-system-design.md](docs/game-im-system-design.md)。
 
 ## License
 
