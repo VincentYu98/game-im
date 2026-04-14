@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -38,14 +39,17 @@ type MsgService interface {
 }
 
 type msgService struct {
-	redis    *store.RedisStore
-	mongo    *store.MongoStore
-	ban      BanService
-	channels ChannelService
-	filter   *FilterChain
-	engine   *delivery.Engine
-	writeCh  chan *store.MessageDoc // async DB write channel
-	logger   *slog.Logger
+	redis      *store.RedisStore
+	mongo      *store.MongoStore
+	ban        BanService
+	channels   ChannelService
+	filter     *FilterChain
+	engine     *delivery.Engine
+	seqAlloc   *SeqAllocator
+	banCache   *LocalCache // 5s TTL cache for ban checks
+	availCache *LocalCache // 5s TTL cache for channel availability
+	writeCh    chan *store.MessageDoc
+	logger     *slog.Logger
 }
 
 func NewMsgService(
@@ -58,14 +62,17 @@ func NewMsgService(
 	logger *slog.Logger,
 ) MsgService {
 	s := &msgService{
-		redis:    redis,
-		mongo:    mongo,
-		ban:      ban,
-		channels: channels,
-		filter:   filter,
-		engine:   engine,
-		writeCh:  make(chan *store.MessageDoc, 4096),
-		logger:   logger,
+		redis:      redis,
+		mongo:      mongo,
+		ban:        ban,
+		channels:   channels,
+		filter:     filter,
+		engine:     engine,
+		seqAlloc:   NewSeqAllocator(redis),
+		banCache:   NewLocalCache(5 * time.Second),
+		availCache: NewLocalCache(5 * time.Second),
+		writeCh:    make(chan *store.MessageDoc, 4096),
+		logger:     logger,
 	}
 	go s.asyncWriter()
 	return s
@@ -85,25 +92,31 @@ func (s *msgService) SendMsg(ctx context.Context, uid int64, sender *pb.SenderIn
 		content = filterResult.Replace
 	}
 
-	// 2. ALL Redis checks + seq alloc in 1 Lua script (1 RTT)
-	check, err := s.redis.SendMsgCheck(ctx, req.ClientMsgID, uid, int32(req.ChannelType), req.ChannelID, ratePerSecond)
+	// 2. Local cache checks — ban + channel availability (0 Redis RTT)
+	if banned := s.checkBanCached(ctx, uid); banned {
+		return nil, errs.ErrUserBanned
+	}
+	if avail := s.checkAvailCached(ctx, req.ChannelType); !avail {
+		return nil, errs.ErrChannelUnavail
+	}
+
+	// 3. Allocate seq from memory (0 Redis RTT on hit, 1 RTT on batch refill)
+	msgID, err := s.seqAlloc.Next(ctx, req.ChannelID)
+	if err != nil {
+		return nil, errs.ErrServerError
+	}
+
+	// 4. Dedup + rate limit in slim Lua (1 Redis RTT, only 2-3 operations)
+	check, err := s.redis.DedupAndRateCheck(ctx, req.ClientMsgID, uid, ratePerSecond, msgID)
 	if err != nil {
 		return nil, errs.ErrServerError
 	}
 	if check.DedupExists {
 		return &SendMsgResp{MsgID: check.DedupMsgID, SendTime: time.Now().UnixMilli()}, nil
 	}
-	if check.IsBanned {
-		return nil, errs.ErrUserBanned
-	}
-	if !check.IsAvailable {
-		return nil, errs.ErrChannelUnavail
-	}
 	if !check.RateOK {
 		return nil, errs.ErrRateLimited
 	}
-
-	msgID := check.MsgID
 	sendTime := time.Now().UnixMilli()
 
 	// 3. Build message
@@ -233,4 +246,32 @@ func (s *msgService) asyncWriter() {
 			flush()
 		}
 	}
+}
+
+// checkBanCached checks if a user is banned, using local cache first (5s TTL).
+func (s *msgService) checkBanCached(ctx context.Context, uid int64) bool {
+	cacheKey := fmt.Sprintf("ban:%d", uid)
+	if val, ok := s.banCache.Get(cacheKey); ok {
+		return val.(bool)
+	}
+	banned, _, err := s.ban.IsBanned(ctx, uid)
+	if err != nil {
+		return false // fail open
+	}
+	s.banCache.Set(cacheKey, banned)
+	return banned
+}
+
+// checkAvailCached checks if a channel type is available, using local cache (5s TTL).
+func (s *msgService) checkAvailCached(ctx context.Context, channelType pb.ChannelType) bool {
+	cacheKey := fmt.Sprintf("avail:%d", int32(channelType))
+	if val, ok := s.availCache.Get(cacheKey); ok {
+		return val.(bool)
+	}
+	avail, err := s.channels.IsAvailable(ctx, channelType)
+	if err != nil {
+		return true // fail open
+	}
+	s.availCache.Set(cacheKey, avail)
+	return avail
 }

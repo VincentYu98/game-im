@@ -156,6 +156,13 @@ func (s *RedisStore) NextSeq(ctx context.Context, channelID string) (int64, erro
 	return s.client.Incr(ctx, key).Result()
 }
 
+// IncrBy atomically increments the seq counter by delta. Used by SeqAllocator
+// to reserve a batch of sequence numbers in one call.
+func (s *RedisStore) IncrBy(ctx context.Context, channelID string, delta int64) (int64, error) {
+	key := fmt.Sprintf(keySeq, channelID)
+	return s.client.IncrBy(ctx, key, delta).Result()
+}
+
 func (s *RedisStore) GetCurrentSeq(ctx context.Context, channelID string) (int64, error) {
 	key := fmt.Sprintf(keySeq, channelID)
 	val, err := s.client.Get(ctx, key).Int64()
@@ -403,98 +410,72 @@ func (s *RedisStore) IsChannelAvailable(ctx context.Context, channelType int32) 
 	return val == "1", nil
 }
 
-// ─── Single-RTT SendMsg Check (Lua) ─────────────────────
+// ─── Lightweight Lua: dedup + rate limit only ───────────
 
-// SendCheckResult holds the result of the all-in-one Lua pre-check.
-type SendCheckResult struct {
+// DedupRateResult holds the result of the slim dedup+rate Lua check.
+type DedupRateResult struct {
 	DedupExists bool
 	DedupMsgID  int64
-	IsBanned    bool
-	IsAvailable bool
 	RateOK      bool
-	MsgID       int64 // newly allocated sequence number
 }
 
-// sendCheckScript does dedup + ban + availability + rate-limit + seq alloc + dedup mark
-// in a SINGLE Redis round-trip. Returns an array:
-//   [dedup_msg_id or -1, is_banned(0/1), is_available(0/1), rate_val, new_seq]
-var sendCheckScript = redis.NewScript(`
-local dedup_key   = KEYS[1]
-local ban_key     = KEYS[2]
-local avail_key   = KEYS[3]
-local rate_key    = KEYS[4]
-local seq_key     = KEYS[5]
-local rate_limit  = tonumber(ARGV[1])
-local rate_ttl    = tonumber(ARGV[2])
-local dedup_ttl   = tonumber(ARGV[3])
+// dedupRateScript checks dedup and rate limit in a single Redis RTT.
+// Only 2-3 Redis operations (vs 6 before), runs ~2x faster.
+// Returns: [dedup_msg_id or -1, rate_count]
+var dedupRateScript = redis.NewScript(`
+local dedup_key  = KEYS[1]
+local rate_key   = KEYS[2]
+local rate_limit = tonumber(ARGV[1])
+local rate_ttl   = tonumber(ARGV[2])
+local dedup_ttl  = tonumber(ARGV[3])
+local seq_hint   = tonumber(ARGV[4])
 
 -- 1. Dedup check
 local dedup_val = redis.call('GET', dedup_key)
 if dedup_val then
-    return {tonumber(dedup_val), 0, 1, 0, 0}
+    return {tonumber(dedup_val), 0}
 end
 
--- 2. Ban check
-local banned = redis.call('EXISTS', ban_key)
-
--- 3. Channel availability (absent = available)
-local avail_val = redis.call('GET', avail_key)
-local available = 1
-if avail_val and avail_val ~= '1' then
-    available = 0
-end
-
--- 4. Rate limit (atomic INCR + EXPIRE)
+-- 2. Rate limit (atomic INCR + EXPIRE)
 local rate_count = redis.call('INCR', rate_key)
 if rate_count == 1 then
     redis.call('EXPIRE', rate_key, rate_ttl)
 end
 
--- 5. Sequence allocation
-local seq = redis.call('INCR', seq_key)
-
--- 6. Mark dedup atomically (so retries see it immediately)
-if dedup_ttl > 0 then
-    redis.call('SET', dedup_key, seq, 'EX', dedup_ttl)
+-- 3. Mark dedup with the seq hint (set by caller from SeqAllocator)
+if dedup_ttl > 0 and seq_hint > 0 then
+    redis.call('SET', dedup_key, seq_hint, 'EX', dedup_ttl)
 end
 
-return {-1, banned, available, rate_count, seq}
+return {-1, rate_count}
 `)
 
-// SendMsgCheck performs all pre-send checks + seq allocation in 1 Redis RTT.
-func (s *RedisStore) SendMsgCheck(ctx context.Context, clientMsgID string, uid int64, channelType int32, channelID string, rateLimit int64) (*SendCheckResult, error) {
+// DedupAndRateCheck performs dedup + rate limit check in 1 Redis RTT.
+// Ban and availability are checked from local cache by the caller.
+// Seq is allocated by SeqAllocator, passed here as seqHint for dedup marking.
+func (s *RedisStore) DedupAndRateCheck(ctx context.Context, clientMsgID string, uid int64, rateLimit int64, seqHint int64) (*DedupRateResult, error) {
 	keys := []string{
 		fmt.Sprintf(keyDedup, clientMsgID),
-		fmt.Sprintf(keyBan, uid),
-		fmt.Sprintf(keyChannelAvail, channelType),
 		fmt.Sprintf(keyRateLimit, uid),
-		fmt.Sprintf(keySeq, channelID),
 	}
 	dedupTTLSec := 0
 	if clientMsgID != "" {
 		dedupTTLSec = int(dedupTTL.Seconds())
 	}
-	args := []any{rateLimit, int(rateLimitTTL.Seconds()), dedupTTLSec}
+	args := []any{rateLimit, int(rateLimitTTL.Seconds()), dedupTTLSec, seqHint}
 
-	res, err := sendCheckScript.Run(ctx, s.client, keys, args...).Int64Slice()
+	res, err := dedupRateScript.Run(ctx, s.client, keys, args...).Int64Slice()
 	if err != nil {
 		return nil, err
 	}
 
-	result := &SendCheckResult{
-		IsAvailable: res[2] == 1,
-		RateOK:      res[3] <= rateLimit,
-		MsgID:       res[4],
+	result := &DedupRateResult{
+		RateOK: res[1] <= rateLimit,
 	}
-
 	if res[0] >= 0 {
 		result.DedupExists = true
 		result.DedupMsgID = res[0]
 	}
-	if res[1] == 1 {
-		result.IsBanned = true
-	}
-
 	return result, nil
 }
 
