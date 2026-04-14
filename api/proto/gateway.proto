@@ -1,0 +1,24 @@
+syntax = "proto3";
+package im.gateway.v1;
+option go_package = "game-im/api/pb";
+
+// Frame is the wire envelope for every TCP packet.
+// Wire format: [4-byte big-endian body_len][proto-serialized Frame]
+message Frame {
+  uint32 cmd_id  = 1;  // Command ID, maps to handler
+  uint32 seq     = 2;  // Client sequence number, echoed in response
+  bytes  payload = 3;  // Serialized inner message (e.g. SendMsgReq)
+}
+
+// CmdId constants (defined in Go code, documented here for reference):
+//
+//   1001  AuthReq          client → server
+//   1002  AuthResp         server → client
+//   2001  SendMsgReq       client → server
+//   2002  SendMsgResp      server → client
+//   2003  PullMsgReq       client → server
+//   2004  PullMsgResp      server → client
+//   2005  AckMsgReq        client → server (no response)
+//   3001  HeartbeatReq     client → server
+//   3002  HeartbeatResp    server → client
+//   4001  PushNewMessage   server → client (push)
