@@ -142,7 +142,12 @@ func New(cfg *configs.Config) (*App, error) {
 		if err != nil {
 			return
 		}
-		connMgr.PushToAll(data)
+		// Skip sender — they already received SendMsgResp and know their own message.
+		var senderUID int64
+		if msg.Sender != nil {
+			senderUID = msg.Sender.SenderId
+		}
+		connMgr.PushToAllExcept(data, senderUID)
 	})
 
 	msgBus.Subscribe(bus.TopicSystemBroadcast, func(ctx context.Context, topic string, msg *pb.ImMessage) {

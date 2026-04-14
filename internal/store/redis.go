@@ -403,83 +403,121 @@ func (s *RedisStore) IsChannelAvailable(ctx context.Context, channelType int32) 
 	return val == "1", nil
 }
 
-// ─── Pipelined Pre-checks ───────────────────────────────
+// ─── Single-RTT SendMsg Check (Lua) ─────────────────────
 
-// PreCheckResult holds pipelined pre-check results for SendMsg.
-type PreCheckResult struct {
-	DedupExists  bool
-	DedupMsgID   int64
-	IsBanned     bool
-	BanExpireAt  int64
-	IsAvailable  bool
+// SendCheckResult holds the result of the all-in-one Lua pre-check.
+type SendCheckResult struct {
+	DedupExists bool
+	DedupMsgID  int64
+	IsBanned    bool
+	IsAvailable bool
+	RateOK      bool
+	MsgID       int64 // newly allocated sequence number
 }
 
-// SendMsgPreCheck pipelines dedup + ban + channel-availability checks
-// into a single Redis round-trip (3 commands instead of 3 sequential RTTs).
-func (s *RedisStore) SendMsgPreCheck(ctx context.Context, clientMsgID string, uid int64, channelType int32) (*PreCheckResult, error) {
-	pipe := s.client.Pipeline()
+// sendCheckScript does dedup + ban + availability + rate-limit + seq alloc + dedup mark
+// in a SINGLE Redis round-trip. Returns an array:
+//   [dedup_msg_id or -1, is_banned(0/1), is_available(0/1), rate_val, new_seq]
+var sendCheckScript = redis.NewScript(`
+local dedup_key   = KEYS[1]
+local ban_key     = KEYS[2]
+local avail_key   = KEYS[3]
+local rate_key    = KEYS[4]
+local seq_key     = KEYS[5]
+local rate_limit  = tonumber(ARGV[1])
+local rate_ttl    = tonumber(ARGV[2])
+local dedup_ttl   = tonumber(ARGV[3])
 
-	// 1. Dedup check
-	dedupKey := fmt.Sprintf(keyDedup, clientMsgID)
-	dedupCmd := pipe.Get(ctx, dedupKey)
+-- 1. Dedup check
+local dedup_val = redis.call('GET', dedup_key)
+if dedup_val then
+    return {tonumber(dedup_val), 0, 1, 0, 0}
+end
 
-	// 2. Ban check
-	banKey := fmt.Sprintf(keyBan, uid)
-	banCmd := pipe.HGetAll(ctx, banKey)
+-- 2. Ban check
+local banned = redis.call('EXISTS', ban_key)
 
-	// 3. Channel availability
-	availKey := fmt.Sprintf(keyChannelAvail, channelType)
-	availCmd := pipe.Get(ctx, availKey)
+-- 3. Channel availability (absent = available)
+local avail_val = redis.call('GET', avail_key)
+local available = 1
+if avail_val and avail_val ~= '1' then
+    available = 0
+end
 
-	_, err := pipe.Exec(ctx)
-	if err != nil && err != redis.Nil {
-		// Pipeline may return redis.Nil for individual keys that don't exist;
-		// check individual commands instead.
+-- 4. Rate limit (atomic INCR + EXPIRE)
+local rate_count = redis.call('INCR', rate_key)
+if rate_count == 1 then
+    redis.call('EXPIRE', rate_key, rate_ttl)
+end
+
+-- 5. Sequence allocation
+local seq = redis.call('INCR', seq_key)
+
+-- 6. Mark dedup atomically (so retries see it immediately)
+if dedup_ttl > 0 then
+    redis.call('SET', dedup_key, seq, 'EX', dedup_ttl)
+end
+
+return {-1, banned, available, rate_count, seq}
+`)
+
+// SendMsgCheck performs all pre-send checks + seq allocation in 1 Redis RTT.
+func (s *RedisStore) SendMsgCheck(ctx context.Context, clientMsgID string, uid int64, channelType int32, channelID string, rateLimit int64) (*SendCheckResult, error) {
+	keys := []string{
+		fmt.Sprintf(keyDedup, clientMsgID),
+		fmt.Sprintf(keyBan, uid),
+		fmt.Sprintf(keyChannelAvail, channelType),
+		fmt.Sprintf(keyRateLimit, uid),
+		fmt.Sprintf(keySeq, channelID),
 	}
-	_ = err
+	dedupTTLSec := 0
+	if clientMsgID != "" {
+		dedupTTLSec = int(dedupTTL.Seconds())
+	}
+	args := []any{rateLimit, int(rateLimitTTL.Seconds()), dedupTTLSec}
 
-	result := &PreCheckResult{IsAvailable: true}
+	res, err := sendCheckScript.Run(ctx, s.client, keys, args...).Int64Slice()
+	if err != nil {
+		return nil, err
+	}
 
-	// Parse dedup
-	if val, err := dedupCmd.Int64(); err == nil {
+	result := &SendCheckResult{
+		IsAvailable: res[2] == 1,
+		RateOK:      res[3] <= rateLimit,
+		MsgID:       res[4],
+	}
+
+	if res[0] >= 0 {
 		result.DedupExists = true
-		result.DedupMsgID = val
+		result.DedupMsgID = res[0]
 	}
-
-	// Parse ban
-	if banResult, err := banCmd.Result(); err == nil && len(banResult) > 0 {
+	if res[1] == 1 {
 		result.IsBanned = true
-		fmt.Sscanf(banResult["expire_at"], "%d", &result.BanExpireAt)
 	}
-
-	// Parse availability (absent key = available)
-	if val, err := availCmd.Result(); err == nil {
-		result.IsAvailable = val == "1"
-	}
-	// redis.Nil means key absent → default available (already set above)
 
 	return result, nil
 }
 
-// PostSendPipeline pipelines the post-send Redis operations:
-// message cache push + dedup mark. Single round-trip.
-func (s *RedisStore) PostSendPipeline(ctx context.Context, channelID string, msg *pb.ImMessage, clientMsgID string, msgID int64) error {
-	data, err := proto.Marshal(msg)
-	if err != nil {
-		return err
-	}
+// PostSendAsync writes the message cache asynchronously. The caller
+// does NOT wait for this — the client already has its response.
+// Dedup is already set atomically in the Lua script.
+func (s *RedisStore) PostSendAsync(channelID string, msg *pb.ImMessage) {
+	go func() {
+		ctx := context.Background()
+		data, err := proto.Marshal(msg)
+		if err != nil {
+			s.logger.Warn("post-send marshal failed", "err", err)
+			return
+		}
 
-	cacheKey := fmt.Sprintf(keyMsgCache, channelID)
-	pipe := s.client.Pipeline()
-	pipe.LPush(ctx, cacheKey, data)
-	pipe.LTrim(ctx, cacheKey, 0, msgCacheMaxLen-1)
-	pipe.Expire(ctx, cacheKey, msgCacheTTL)
+		cacheKey := fmt.Sprintf(keyMsgCache, channelID)
+		pipe := s.client.Pipeline()
+		pipe.LPush(ctx, cacheKey, data)
+		pipe.LTrim(ctx, cacheKey, 0, msgCacheMaxLen-1)
+		pipe.Expire(ctx, cacheKey, msgCacheTTL)
 
-	if clientMsgID != "" {
-		dedupKey := fmt.Sprintf(keyDedup, clientMsgID)
-		pipe.Set(ctx, dedupKey, msgID, dedupTTL)
-	}
-
-	_, err = pipe.Exec(ctx)
-	return err
+		if _, err := pipe.Exec(ctx); err != nil {
+			s.logger.Warn("post-send pipeline failed", "err", err)
+		}
+	}()
 }

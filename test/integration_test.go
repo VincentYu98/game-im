@@ -179,14 +179,7 @@ func TestIntegration_WorldBroadcast(t *testing.T) {
 		t.Fatalf("unexpected push: %+v", push)
 	}
 
-	// Client A should also receive the push (world broadcasts to all).
-	pushA, err := clientA.ReadPush(3 * time.Second)
-	if err != nil {
-		t.Fatalf("client A read push: %v", err)
-	}
-	if pushA.Message == nil || pushA.Message.Content != "broadcast msg" {
-		t.Fatalf("unexpected push A: %+v", pushA)
-	}
+	// Client A (sender) should NOT receive the push — sender is skipped in world broadcast.
 }
 
 func TestIntegration_RateLimit(t *testing.T) {

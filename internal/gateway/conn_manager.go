@@ -82,6 +82,20 @@ func (m *ConnManager) PushToAll(data []byte) {
 	})
 }
 
+// PushToAllExcept sends raw bytes to all connections except the given uid.
+// Used for world broadcast to skip the sender (they already know their own message).
+func (m *ConnManager) PushToAllExcept(data []byte, excludeUID int64) {
+	m.userConns.Range(func(key, val any) bool {
+		uid := key.(int64)
+		if uid == excludeUID {
+			return true
+		}
+		c := val.(*Conn)
+		c.Send(data)
+		return true
+	})
+}
+
 // Count returns the current number of connections.
 func (m *ConnManager) Count() int64 {
 	return m.count.Load()

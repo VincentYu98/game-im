@@ -19,7 +19,8 @@ type Conn struct {
 	id      string
 	uid     atomic.Int64 // 0 until authenticated
 	netConn net.Conn
-	sendCh  chan []byte // buffered outbound queue
+	respCh  chan []byte // HIGH priority: request-response frames
+	pushCh  chan []byte // LOW priority: server-pushed notifications
 	reader  *bufio.Reader
 
 	mgr        *ConnManager
@@ -36,7 +37,8 @@ func newConn(nc net.Conn, mgr *ConnManager, dispatcher *Dispatcher, sendChanSize
 	c := &Conn{
 		id:         connID,
 		netConn:    nc,
-		sendCh:     make(chan []byte, sendChanSize),
+		respCh:     make(chan []byte, 64),             // small: responses are rare
+		pushCh:     make(chan []byte, sendChanSize),    // large: pushes can burst
 		reader:     bufio.NewReaderSize(nc, 4096),
 		mgr:        mgr,
 		dispatcher: dispatcher,
@@ -56,18 +58,27 @@ func (c *Conn) UID() int64 { return c.uid.Load() }
 // SetUID binds a user ID to this connection after authentication.
 func (c *Conn) SetUID(uid int64) { c.uid.Store(uid) }
 
-// Send enqueues data to the outbound buffer. Drops silently if full (slow consumer).
+// Send enqueues a push message (low priority). Drops if full.
 func (c *Conn) Send(data []byte) bool {
 	select {
-	case c.sendCh <- data:
+	case c.pushCh <- data:
 		return true
 	default:
-		c.logger.Warn("send channel full, dropping message", "uid", c.UID())
 		return false
 	}
 }
 
-// SendFrame marshals and sends a Frame to the client.
+// SendResp enqueues a response frame (high priority). Drops if full.
+func (c *Conn) SendResp(data []byte) bool {
+	select {
+	case c.respCh <- data:
+		return true
+	default:
+		return false
+	}
+}
+
+// SendFrame marshals and sends a Frame via the push channel.
 func (c *Conn) SendFrame(cmdID, seq uint32, payload []byte) error {
 	data, err := EncodeRaw(cmdID, seq, payload)
 	if err != nil {
@@ -101,7 +112,6 @@ func (c *Conn) readLoop(ctx context.Context) {
 	for {
 		frame, err := Decode(c.reader)
 		if err != nil {
-			// Connection closed or read error — normal shutdown path.
 			return
 		}
 		c.lastHeartbeat.Store(time.Now().UnixMilli())
@@ -112,28 +122,70 @@ func (c *Conn) readLoop(ctx context.Context) {
 	}
 }
 
+// writeLoop drains respCh (high priority) before pushCh (low priority).
+// Batches multiple pending frames into a single net.Conn.Write call.
 func (c *Conn) writeLoop() {
 	defer c.Close()
 
+	// Reusable write buffer to batch frames.
+	buf := make([]byte, 0, 16384)
+
 	for {
+		// Block until at least one frame is available (either channel).
 		select {
-		case data, ok := <-c.sendCh:
+		case data, ok := <-c.respCh:
 			if !ok {
 				return
 			}
-			if _, err := c.netConn.Write(data); err != nil {
+			buf = append(buf[:0], data...)
+		case data, ok := <-c.pushCh:
+			if !ok {
 				return
 			}
+			buf = append(buf[:0], data...)
 		case <-c.done:
-			// Drain remaining messages before exit.
-			for {
-				select {
-				case data := <-c.sendCh:
-					c.netConn.Write(data)
-				default:
-					return
-				}
+			c.drainAndClose()
+			return
+		}
+
+		// Drain all pending responses first (high priority batch).
+		for {
+			select {
+			case data := <-c.respCh:
+				buf = append(buf, data...)
+			default:
+				goto doneResp
 			}
+		}
+	doneResp:
+
+		// Then drain pending pushes (up to a cap to avoid starving writes).
+		for range 128 {
+			select {
+			case data := <-c.pushCh:
+				buf = append(buf, data...)
+			default:
+				goto donePush
+			}
+		}
+	donePush:
+
+		// Single write syscall for the entire batch.
+		if _, err := c.netConn.Write(buf); err != nil {
+			return
+		}
+	}
+}
+
+func (c *Conn) drainAndClose() {
+	for {
+		select {
+		case data := <-c.respCh:
+			c.netConn.Write(data)
+		case data := <-c.pushCh:
+			c.netConn.Write(data)
+		default:
+			return
 		}
 	}
 }
@@ -152,7 +204,12 @@ func (c *Conn) LastHeartbeat() int64 {
 	return c.lastHeartbeat.Load()
 }
 
-// Reply is a convenience method to send a response for a given Frame.
+// Reply sends a high-priority response frame for a given request.
 func (c *Conn) Reply(frame *pb.Frame, respCmdID uint32, payload []byte) error {
-	return c.SendFrame(respCmdID, frame.Seq, payload)
+	data, err := EncodeRaw(respCmdID, frame.Seq, payload)
+	if err != nil {
+		return err
+	}
+	c.SendResp(data)
+	return nil
 }

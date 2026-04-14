@@ -72,12 +72,10 @@ func NewMsgService(
 }
 
 func (s *msgService) SendMsg(ctx context.Context, uid int64, sender *pb.SenderInfo, req *SendMsgReq) (*SendMsgResp, error) {
-	// 1. Content length check (CPU-only, no I/O)
+	// 1. CPU-only checks (no I/O)
 	if len(req.Content) > maxMsgLength {
 		return nil, errs.ErrMsgTooLong
 	}
-
-	// 2. Content filter (CPU-only, no I/O)
 	filterResult := s.filter.Check(uid, req.Content)
 	if !filterResult.Pass {
 		return nil, errs.ErrContentIllegal
@@ -87,40 +85,28 @@ func (s *msgService) SendMsg(ctx context.Context, uid int64, sender *pb.SenderIn
 		content = filterResult.Replace
 	}
 
-	// 3. Pipelined pre-checks: dedup + ban + channel-availability (1 Redis RTT)
-	preCheck, err := s.redis.SendMsgPreCheck(ctx, req.ClientMsgID, uid, int32(req.ChannelType))
+	// 2. ALL Redis checks + seq alloc in 1 Lua script (1 RTT)
+	check, err := s.redis.SendMsgCheck(ctx, req.ClientMsgID, uid, int32(req.ChannelType), req.ChannelID, ratePerSecond)
 	if err != nil {
-		s.logger.Warn("pre-check pipeline failed, falling back", "err", err)
-	} else {
-		if preCheck.DedupExists {
-			return &SendMsgResp{MsgID: preCheck.DedupMsgID, SendTime: time.Now().UnixMilli()}, nil
-		}
-		if preCheck.IsBanned {
-			return nil, errs.ErrUserBanned
-		}
-		if !preCheck.IsAvailable {
-			return nil, errs.ErrChannelUnavail
-		}
+		return nil, errs.ErrServerError
 	}
-
-	// 4. Rate limit (1 Redis RTT — Lua script, atomic)
-	allowed, err := s.redis.CheckRateLimit(ctx, uid, ratePerSecond)
-	if err != nil {
-		return nil, err
+	if check.DedupExists {
+		return &SendMsgResp{MsgID: check.DedupMsgID, SendTime: time.Now().UnixMilli()}, nil
 	}
-	if !allowed {
+	if check.IsBanned {
+		return nil, errs.ErrUserBanned
+	}
+	if !check.IsAvailable {
+		return nil, errs.ErrChannelUnavail
+	}
+	if !check.RateOK {
 		return nil, errs.ErrRateLimited
 	}
 
-	// 5. Allocate sequence number (1 Redis RTT)
-	msgID, err := s.redis.NextSeq(ctx, req.ChannelID)
-	if err != nil {
-		return nil, err
-	}
-
+	msgID := check.MsgID
 	sendTime := time.Now().UnixMilli()
 
-	// 6. Build message
+	// 3. Build message
 	msg := &pb.ImMessage{
 		MsgId:       msgID,
 		ChannelId:   req.ChannelID,
@@ -133,19 +119,19 @@ func (s *msgService) SendMsg(ctx context.Context, uid int64, sender *pb.SenderIn
 		ClientMsgId: req.ClientMsgID,
 	}
 
-	// 7. Pipelined post-send: cache push + dedup mark (1 Redis RTT)
-	if err := s.redis.PostSendPipeline(ctx, req.ChannelID, msg, req.ClientMsgID, msgID); err != nil {
-		s.logger.Warn("post-send pipeline failed", "err", err)
-	}
+	// 4. Post-send: cache write — ASYNC, does not block response
+	//    (dedup is already set atomically in the Lua script)
+	s.redis.PostSendAsync(req.ChannelID, msg)
 
-	// 11. Async DB write
+	// 5. Async DB write (buffered channel, non-blocking)
 	senderID := int64(0)
 	senderName := ""
 	if sender != nil {
 		senderID = sender.SenderId
 		senderName = sender.SenderName
 	}
-	s.writeCh <- &store.MessageDoc{
+	select {
+	case s.writeCh <- &store.MessageDoc{
 		MsgID:       msgID,
 		ChannelID:   req.ChannelID,
 		ChannelType: int32(req.ChannelType),
@@ -156,9 +142,12 @@ func (s *msgService) SendMsg(ctx context.Context, uid int64, sender *pb.SenderIn
 		MsgParam:    req.MsgParam,
 		SendTime:    sendTime,
 		CreatedAt:   time.Now(),
+	}:
+	default:
+		s.logger.Warn("write channel full, dropping message for async write")
 	}
 
-	// 12. Deliver
+	// 6. Deliver (world/system are async via bus goroutine)
 	if err := s.engine.Deliver(ctx, msg); err != nil {
 		s.logger.Error("delivery failed", "msgId", msgID, "err", err)
 	}
