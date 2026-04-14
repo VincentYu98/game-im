@@ -142,9 +142,7 @@ func (c *TCPClient) Heartbeat() (*pb.HeartbeatResp, error) {
 }
 
 // ReadPush reads the next server-pushed PushNewMessage.
-// First checks the internal push buffer, then reads from the wire.
 func (c *TCPClient) ReadPush(timeout time.Duration) (*pb.PushNewMessage, error) {
-	// Check buffer first.
 	c.mu.Lock()
 	if len(c.pushBuf) > 0 {
 		f := c.pushBuf[0]
@@ -154,7 +152,6 @@ func (c *TCPClient) ReadPush(timeout time.Duration) (*pb.PushNewMessage, error) 
 	}
 	c.mu.Unlock()
 
-	// Read from wire.
 	c.conn.SetReadDeadline(time.Now().Add(timeout))
 	f, err := gateway.Decode(c.reader)
 	if err != nil {
@@ -164,6 +161,47 @@ func (c *TCPClient) ReadPush(timeout time.Duration) (*pb.PushNewMessage, error) 
 		return nil, fmt.Errorf("expected CmdPushNewMessage (4001), got %d", f.CmdId)
 	}
 	return decodePush(f)
+}
+
+// ReadWorldNotify reads the next WorldNotify frame.
+func (c *TCPClient) ReadWorldNotify(timeout time.Duration) (*pb.WorldNotify, error) {
+	c.mu.Lock()
+	for i, f := range c.pushBuf {
+		if f.CmdId == gateway.CmdWorldNotify {
+			c.pushBuf = append(c.pushBuf[:i], c.pushBuf[i+1:]...)
+			c.mu.Unlock()
+			var notify pb.WorldNotify
+			if err := proto.Unmarshal(f.Payload, &notify); err != nil {
+				return nil, err
+			}
+			return &notify, nil
+		}
+	}
+	c.mu.Unlock()
+
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("timeout waiting for WorldNotify")
+		}
+		c.conn.SetReadDeadline(time.Now().Add(remaining))
+		f, err := gateway.Decode(c.reader)
+		if err != nil {
+			return nil, err
+		}
+		if f.CmdId == gateway.CmdWorldNotify {
+			var notify pb.WorldNotify
+			if err := proto.Unmarshal(f.Payload, &notify); err != nil {
+				return nil, err
+			}
+			return &notify, nil
+		}
+		// Buffer other frames.
+		c.mu.Lock()
+		c.pushBuf = append(c.pushBuf, f)
+		c.mu.Unlock()
+	}
 }
 
 // readFrameExpect reads frames, buffers any interleaved push messages,

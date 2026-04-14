@@ -106,3 +106,10 @@ message HeartbeatResp {
 message PushNewMessage {
   ImMessage message = 1;
 }
+
+// Lightweight notification for world/system channels.
+// Client should call PullMsg if chat UI is open.
+message WorldNotify {
+  string channel_id = 1;
+  int64  latest_seq = 2;  // latest msg_id in this channel
+}

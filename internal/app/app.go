@@ -131,37 +131,30 @@ func New(cfg *configs.Config) (*App, error) {
 	// 13. Gateway Server
 	gwServer := gateway.NewServer(cfg.Gateway, connMgr, dispatcher, heartbeat, logger.With("component", "gateway"))
 
-	// 14. Subscribe bus for world/system broadcast
-	msgBus.Subscribe(bus.TopicWorldBroadcast, func(ctx context.Context, topic string, msg *pb.ImMessage) {
-		pushMsg := &pb.PushNewMessage{Message: msg}
-		payload, err := proto.Marshal(pushMsg)
+	// 14. Subscribe bus for world/system broadcast — lightweight notify only.
+	// Clients receive a small WorldNotify{channel_id, latest_seq} and call
+	// PullMsg themselves if the chat UI is open.
+	broadcastNotify := func(_ context.Context, _ string, msg *pb.ImMessage) {
+		notify := &pb.WorldNotify{
+			ChannelId: msg.ChannelId,
+			LatestSeq: msg.MsgId,
+		}
+		payload, err := proto.Marshal(notify)
 		if err != nil {
 			return
 		}
-		data, err := gateway.EncodeRaw(gateway.CmdPushNewMessage, 0, payload)
+		data, err := gateway.EncodeRaw(gateway.CmdWorldNotify, 0, payload)
 		if err != nil {
 			return
 		}
-		// Skip sender — they already received SendMsgResp and know their own message.
 		var senderUID int64
 		if msg.Sender != nil {
 			senderUID = msg.Sender.SenderId
 		}
 		connMgr.PushToAllExcept(data, senderUID)
-	})
-
-	msgBus.Subscribe(bus.TopicSystemBroadcast, func(ctx context.Context, topic string, msg *pb.ImMessage) {
-		pushMsg := &pb.PushNewMessage{Message: msg}
-		payload, err := proto.Marshal(pushMsg)
-		if err != nil {
-			return
-		}
-		data, err := gateway.EncodeRaw(gateway.CmdPushNewMessage, 0, payload)
-		if err != nil {
-			return
-		}
-		connMgr.PushToAll(data)
-	})
+	}
+	msgBus.Subscribe(bus.TopicWorldBroadcast, broadcastNotify)
+	msgBus.Subscribe(bus.TopicSystemBroadcast, broadcastNotify)
 
 	return &App{
 		cfg:         cfg,

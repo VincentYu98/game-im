@@ -12,4 +12,5 @@ const (
 	CmdHeartbeatReq  uint32 = 3001
 	CmdHeartbeatResp uint32 = 3002
 	CmdPushNewMessage uint32 = 4001
+	CmdWorldNotify    uint32 = 4002
 )

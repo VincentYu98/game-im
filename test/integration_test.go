@@ -170,16 +170,25 @@ func TestIntegration_WorldBroadcast(t *testing.T) {
 		t.Fatalf("send: err=%v resp=%+v", err, sendResp)
 	}
 
-	// Client B should receive the push.
-	push, err := clientB.ReadPush(3 * time.Second)
+	// Client B should receive a WorldNotify (not the full message).
+	notify, err := clientB.ReadWorldNotify(3 * time.Second)
 	if err != nil {
-		t.Fatalf("client B read push: %v", err)
+		t.Fatalf("client B read notify: %v", err)
 	}
-	if push.Message == nil || push.Message.Content != "broadcast msg" {
-		t.Fatalf("unexpected push: %+v", push)
+	if notify.ChannelId != "world" || notify.LatestSeq != sendResp.MsgId {
+		t.Fatalf("unexpected notify: %+v (expected seq=%d)", notify, sendResp.MsgId)
 	}
 
-	// Client A (sender) should NOT receive the push — sender is skipped in world broadcast.
+	// Client B pulls the actual message content.
+	pullResp, err := clientB.PullMsg("world", notify.LatestSeq-1, 10)
+	if err != nil {
+		t.Fatalf("client B pull: %v", err)
+	}
+	if len(pullResp.Messages) == 0 || pullResp.Messages[0].Content != "broadcast msg" {
+		t.Fatalf("pull content mismatch: %+v", pullResp)
+	}
+
+	// Client A (sender) should NOT receive any notification — sender is skipped.
 }
 
 func TestIntegration_RateLimit(t *testing.T) {

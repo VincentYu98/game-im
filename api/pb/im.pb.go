@@ -906,6 +906,60 @@ func (x *PushNewMessage) GetMessage() *ImMessage {
 	return nil
 }
 
+// Lightweight notification for world/system channels.
+// Client should call PullMsg if chat UI is open.
+type WorldNotify struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ChannelId     string                 `protobuf:"bytes,1,opt,name=channel_id,json=channelId,proto3" json:"channel_id,omitempty"`
+	LatestSeq     int64                  `protobuf:"varint,2,opt,name=latest_seq,json=latestSeq,proto3" json:"latest_seq,omitempty"` // latest msg_id in this channel
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WorldNotify) Reset() {
+	*x = WorldNotify{}
+	mi := &file_im_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WorldNotify) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WorldNotify) ProtoMessage() {}
+
+func (x *WorldNotify) ProtoReflect() protoreflect.Message {
+	mi := &file_im_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WorldNotify.ProtoReflect.Descriptor instead.
+func (*WorldNotify) Descriptor() ([]byte, []int) {
+	return file_im_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *WorldNotify) GetChannelId() string {
+	if x != nil {
+		return x.ChannelId
+	}
+	return ""
+}
+
+func (x *WorldNotify) GetLatestSeq() int64 {
+	if x != nil {
+		return x.LatestSeq
+	}
+	return 0
+}
+
 var File_im_proto protoreflect.FileDescriptor
 
 const file_im_proto_rawDesc = "" +
@@ -978,7 +1032,12 @@ const file_im_proto_rawDesc = "" +
 	"\vserver_time\x18\x01 \x01(\x03R\n" +
 	"serverTime\"<\n" +
 	"\x0ePushNewMessage\x12*\n" +
-	"\amessage\x18\x01 \x01(\v2\x10.im.v1.ImMessageR\amessage*\xac\x01\n" +
+	"\amessage\x18\x01 \x01(\v2\x10.im.v1.ImMessageR\amessage\"K\n" +
+	"\vWorldNotify\x12\x1d\n" +
+	"\n" +
+	"channel_id\x18\x01 \x01(\tR\tchannelId\x12\x1d\n" +
+	"\n" +
+	"latest_seq\x18\x02 \x01(\x03R\tlatestSeq*\xac\x01\n" +
 	"\vChannelType\x12\x1c\n" +
 	"\x18CHANNEL_TYPE_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12CHANNEL_TYPE_WORLD\x10\x01\x12\x19\n" +
@@ -1007,7 +1066,7 @@ func file_im_proto_rawDescGZIP() []byte {
 }
 
 var file_im_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_im_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_im_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_im_proto_goTypes = []any{
 	(ChannelType)(0),       // 0: im.v1.ChannelType
 	(MsgType)(0),           // 1: im.v1.MsgType
@@ -1023,13 +1082,14 @@ var file_im_proto_goTypes = []any{
 	(*HeartbeatReq)(nil),   // 11: im.v1.HeartbeatReq
 	(*HeartbeatResp)(nil),  // 12: im.v1.HeartbeatResp
 	(*PushNewMessage)(nil), // 13: im.v1.PushNewMessage
-	nil,                    // 14: im.v1.AuthReq.ChannelLastMsgIdsEntry
+	(*WorldNotify)(nil),    // 14: im.v1.WorldNotify
+	nil,                    // 15: im.v1.AuthReq.ChannelLastMsgIdsEntry
 }
 var file_im_proto_depIdxs = []int32{
 	0,  // 0: im.v1.ImMessage.channel_type:type_name -> im.v1.ChannelType
 	2,  // 1: im.v1.ImMessage.sender:type_name -> im.v1.SenderInfo
 	1,  // 2: im.v1.ImMessage.msg_type:type_name -> im.v1.MsgType
-	14, // 3: im.v1.AuthReq.channel_last_msg_ids:type_name -> im.v1.AuthReq.ChannelLastMsgIdsEntry
+	15, // 3: im.v1.AuthReq.channel_last_msg_ids:type_name -> im.v1.AuthReq.ChannelLastMsgIdsEntry
 	0,  // 4: im.v1.SendMsgReq.channel_type:type_name -> im.v1.ChannelType
 	1,  // 5: im.v1.SendMsgReq.msg_type:type_name -> im.v1.MsgType
 	3,  // 6: im.v1.PullMsgResp.messages:type_name -> im.v1.ImMessage
@@ -1052,7 +1112,7 @@ func file_im_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_im_proto_rawDesc), len(file_im_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   13,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
