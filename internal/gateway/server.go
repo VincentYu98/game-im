@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"time"
 
 	"game-im/configs"
 )
@@ -37,8 +38,9 @@ func NewServer(
 
 // Start begins listening for TCP connections. Blocks until ctx is cancelled.
 func (s *Server) Start(ctx context.Context) error {
+	lc := net.ListenConfig{KeepAlive: 30 * time.Second}
 	var err error
-	s.listener, err = net.Listen("tcp", s.cfg.ListenAddr)
+	s.listener, err = lc.Listen(ctx, "tcp", s.cfg.ListenAddr)
 	if err != nil {
 		return err
 	}
