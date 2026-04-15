@@ -1,0 +1,30 @@
+app:
+  node_id: "docker-1"
+  env: prod
+  shutdown_timeout: 10s
+
+gateway:
+  listen_addr: ":9000"
+  max_connections: 200000
+  max_frame_size: 65536
+  heartbeat_timeout: 60s
+  heartbeat_interval: 15s
+  send_chan_size: 512
+
+redis:
+  addr: "redis:6379"
+  password: ""
+  db: 0
+  pool_size: 200
+
+mongo:
+  uri: "mongodb://mongo:27017"
+  database: "game_im"
+  timeout: 10s
+
+bus:
+  type: "local"
+
+log:
+  level: "warn"
+  format: "text"

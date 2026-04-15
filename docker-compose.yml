@@ -5,6 +5,8 @@ services:
       - "6379:6379"
     volumes:
       - redis-data:/data
+    sysctls:
+      net.core.somaxconn: 65535
 
   mongo:
     image: mongo:7
@@ -14,6 +16,30 @@ services:
       MONGO_INITDB_DATABASE: game_im
     volumes:
       - mongo-data:/data/db
+
+  im-server:
+    build: .
+    ports:
+      - "9000:9000"
+    depends_on:
+      - redis
+      - mongo
+    command: ["/im-server", "--config", "/configs/config.docker.yaml"]
+    volumes:
+      - ./configs/config.docker.yaml:/configs/config.docker.yaml
+    # Linux kernel tuning for high connection count
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_max_syn_backlog: 65535
+    ulimits:
+      nofile:
+        soft: 200000
+        hard: 200000
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "4"
 
 volumes:
   redis-data:
