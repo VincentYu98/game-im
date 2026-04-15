@@ -18,7 +18,7 @@ func newTestConn(t *testing.T) (*Conn, net.Conn) {
 	mgr := NewConnManager("test-node", logger)
 	dispatcher := NewDispatcher(logger)
 	serverSide, clientSide := net.Pipe()
-	c := newConn(serverSide, mgr, dispatcher, 16, logger)
+	c := newConn(serverSide, mgr, dispatcher, 16, nil, logger)
 	mgr.Register(c)
 	return c, clientSide
 }
@@ -67,7 +67,7 @@ func TestConn_Send_DropWhenFull(t *testing.T) {
 	defer clientSide.Close()
 
 	// sendCh capacity = 2
-	c := newConn(serverSide, mgr, dispatcher, 2, logger)
+	c := newConn(serverSide, mgr, dispatcher, 2, nil, logger)
 	defer c.Close()
 
 	c.Send([]byte("a"))

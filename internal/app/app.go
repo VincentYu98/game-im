@@ -128,12 +128,15 @@ func New(cfg *configs.Config) (*App, error) {
 		logger.With("component", "heartbeat"),
 	)
 
-	// 13. Gateway Server
-	gwServer := gateway.NewServer(cfg.Gateway, connMgr, dispatcher, heartbeat, logger.With("component", "gateway"))
+	// 13. Broadcast Ring Buffer — O(1) write, each conn reads via cursor.
+	broadcastRing := gateway.NewBroadcastRing(4096)
 
-	// 14. Subscribe bus for world/system broadcast — lightweight notify only.
-	// Clients receive a small WorldNotify{channel_id, latest_seq} and call
-	// PullMsg themselves if the chat UI is open.
+	// 14. Gateway Server
+	gwServer := gateway.NewServer(cfg.Gateway, connMgr, dispatcher, heartbeat, broadcastRing, logger.With("component", "gateway"))
+
+	// 15. Subscribe bus for world/system broadcast.
+	// Instead of iterating N connections (O(N)), write to ring buffer O(1).
+	// Each conn's ringConsumerLoop will pick it up via its own cursor.
 	broadcastNotify := func(_ context.Context, _ string, msg *pb.ImMessage) {
 		notify := &pb.WorldNotify{
 			ChannelId: msg.ChannelId,
@@ -147,11 +150,7 @@ func New(cfg *configs.Config) (*App, error) {
 		if err != nil {
 			return
 		}
-		var senderUID int64
-		if msg.Sender != nil {
-			senderUID = msg.Sender.SenderId
-		}
-		connMgr.PushToAllExcept(data, senderUID)
+		broadcastRing.Put(data) // O(1) — no iteration over connections!
 	}
 	msgBus.Subscribe(bus.TopicWorldBroadcast, broadcastNotify)
 	msgBus.Subscribe(bus.TopicSystemBroadcast, broadcastNotify)

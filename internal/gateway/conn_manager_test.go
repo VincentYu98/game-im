@@ -11,7 +11,7 @@ func makeStubConn(t *testing.T, mgr *ConnManager) (*Conn, net.Conn) {
 	logger := testLogger()
 	dispatcher := NewDispatcher(logger)
 	server, client := net.Pipe()
-	c := newConn(server, mgr, dispatcher, 16, logger)
+	c := newConn(server, mgr, dispatcher, 16, nil, logger)
 	return c, client
 }
 

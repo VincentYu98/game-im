@@ -16,6 +16,7 @@ type Server struct {
 	connMgr    *ConnManager
 	dispatcher *Dispatcher
 	heartbeat  *HeartbeatManager
+	ring       *BroadcastRing
 	cfg        configs.GatewayConfig
 	logger     *slog.Logger
 }
@@ -25,12 +26,14 @@ func NewServer(
 	connMgr *ConnManager,
 	dispatcher *Dispatcher,
 	heartbeat *HeartbeatManager,
+	ring *BroadcastRing,
 	logger *slog.Logger,
 ) *Server {
 	return &Server{
 		connMgr:    connMgr,
 		dispatcher: dispatcher,
 		heartbeat:  heartbeat,
+		ring:       ring,
 		cfg:        cfg,
 		logger:     logger,
 	}
@@ -66,7 +69,7 @@ func (s *Server) Start(ctx context.Context) error {
 			continue
 		}
 
-		conn := newConn(nc, s.connMgr, s.dispatcher, s.cfg.SendChanSize, s.logger)
+		conn := newConn(nc, s.connMgr, s.dispatcher, s.cfg.SendChanSize, s.ring, s.logger)
 		s.connMgr.Register(conn)
 		go conn.Serve(ctx)
 	}

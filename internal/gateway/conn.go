@@ -20,8 +20,13 @@ type Conn struct {
 	uid     atomic.Int64 // 0 until authenticated
 	netConn net.Conn
 	respCh  chan []byte // HIGH priority: request-response frames
-	pushCh  chan []byte // LOW priority: server-pushed notifications
+	pushCh  chan []byte // LOW priority: per-user pushes (alliance/private)
 	reader  *bufio.Reader
+
+	// Ring buffer cursor for world/system broadcast.
+	// The conn reads from ring[cursor..writePos) on each wake-up.
+	ring   *BroadcastRing
+	cursor atomic.Int64
 
 	mgr        *ConnManager
 	dispatcher *Dispatcher
@@ -32,18 +37,23 @@ type Conn struct {
 	done          chan struct{}
 }
 
-func newConn(nc net.Conn, mgr *ConnManager, dispatcher *Dispatcher, sendChanSize int, logger *slog.Logger) *Conn {
+func newConn(nc net.Conn, mgr *ConnManager, dispatcher *Dispatcher, sendChanSize int, ring *BroadcastRing, logger *slog.Logger) *Conn {
 	connID := uuid.New().String()
 	c := &Conn{
 		id:         connID,
 		netConn:    nc,
-		respCh:     make(chan []byte, 64),             // small: responses are rare
-		pushCh:     make(chan []byte, sendChanSize),    // large: pushes can burst
+		respCh:     make(chan []byte, 64),
+		pushCh:     make(chan []byte, sendChanSize),
 		reader:     bufio.NewReaderSize(nc, 4096),
+		ring:       ring,
 		mgr:        mgr,
 		dispatcher: dispatcher,
 		logger:     logger.With("connId", connID),
 		done:       make(chan struct{}),
+	}
+	// Start cursor at current ring position (only see new messages).
+	if ring != nil {
+		c.cursor.Store(ring.NewCursor())
 	}
 	c.lastHeartbeat.Store(time.Now().UnixMilli())
 	return c
@@ -88,7 +98,7 @@ func (c *Conn) SendFrame(cmdID, seq uint32, payload []byte) error {
 	return nil
 }
 
-// Serve starts the read and write loops. Blocks until the connection closes.
+// Serve starts the read, write, and ring-consumer loops.
 func (c *Conn) Serve(ctx context.Context) {
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -102,6 +112,17 @@ func (c *Conn) Serve(ctx context.Context) {
 		defer wg.Done()
 		c.readLoop(ctx)
 	}()
+
+	// Ring consumer: wait on ring.cond, feed broadcast data into pushCh.
+	// This runs in a 3rd goroutine so writeLoop doesn't need to know about
+	// the ring buffer's sync.Cond mechanism.
+	if c.ring != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.ringConsumerLoop()
+		}()
+	}
 
 	wg.Wait()
 }
@@ -122,16 +143,68 @@ func (c *Conn) readLoop(ctx context.Context) {
 	}
 }
 
-// writeLoop drains respCh (high priority) before pushCh (low priority).
+// ringConsumerLoop reads broadcast messages from the ring buffer and
+// sends them into pushCh. This decouples the ring buffer's sync.Cond
+// from the writeLoop's select{}.
+func (c *Conn) ringConsumerLoop() {
+	for {
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+
+		cur := c.cursor.Load()
+		wp := c.ring.WritePos()
+
+		if cur >= wp {
+			// No new data — wait for signal.
+			// Use a goroutine-safe wait with done check.
+			waitDone := make(chan struct{})
+			go func() {
+				c.ring.Wait(cur)
+				close(waitDone)
+			}()
+			select {
+			case <-waitDone:
+				// New data available.
+			case <-c.done:
+				return
+			}
+			continue
+		}
+
+		// Read all available entries [cur, wp).
+		// Skip entries that are too old (overwritten in ring).
+		capacity := c.ring.Capacity()
+		if wp-cur > capacity {
+			// Consumer is too slow — skip to recent.
+			cur = wp - capacity
+		}
+
+		for pos := cur; pos < wp; pos++ {
+			data := c.ring.Get(pos)
+			if data == nil {
+				continue
+			}
+			select {
+			case c.pushCh <- data:
+			default:
+				// pushCh full — drop broadcast for this slow consumer.
+			}
+		}
+		c.cursor.Store(wp)
+	}
+}
+
+// writeLoop drains respCh (high priority), then pushCh (low priority).
 // Batches multiple pending frames into a single net.Conn.Write call.
 func (c *Conn) writeLoop() {
 	defer c.Close()
-
-	// Reusable write buffer to batch frames.
 	buf := make([]byte, 0, 16384)
 
 	for {
-		// Block until at least one frame is available (either channel).
+		// Block until at least one frame is available.
 		select {
 		case data, ok := <-c.respCh:
 			if !ok {
@@ -159,8 +232,8 @@ func (c *Conn) writeLoop() {
 		}
 	doneResp:
 
-		// Then drain pending pushes (up to a cap to avoid starving writes).
-		for range 128 {
+		// Then drain pending pushes (up to cap).
+		for range 256 {
 			select {
 			case data := <-c.pushCh:
 				buf = append(buf, data...)
@@ -170,7 +243,6 @@ func (c *Conn) writeLoop() {
 		}
 	donePush:
 
-		// Single write syscall for the entire batch.
 		if _, err := c.netConn.Write(buf); err != nil {
 			return
 		}
